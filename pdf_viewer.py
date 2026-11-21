@@ -11,14 +11,17 @@
   表示方法            Ctrl+2 = 1ページ / Ctrl+3 = 見開き2ページ / Ctrl+4 = 1ページ目の単独表示 切替
   綴じ方向(見開き)    Ctrl+5 = 左綴じ/右綴じ 切替 (右綴じでは右ページが先、←キーが「次へ」になる)
   印刷                Ctrl+P  (ツールバーの「印刷」)。印刷ダイアログを表示
-  画像として保存      Ctrl+S  (PDF と同じフォルダへ「PDF名_p001.png」のように保存)
+  画像として保存      Ctrl+S  (PDF と同じフォルダへ「PDF名_p001.png」のように保存)。
+                      画像の長辺(px)は設定ファイルの capture_long_side で指定 (既定 1280)
   フルスクリーン      Ctrl+L  (Esc でも解除)。ツールバーとスクロールバーを隠し、
                       ページ全体が画面に収まる倍率へ自動調整 (切替時/表示方法の変更時のみ)
   テキスト選択/コピー ドラッグで選択, Ctrl+C (ダブルクリック=単語, トリプル=行, Ctrl+A=全選択)
   テキスト以外をドラッグ → 表示領域をスクロール
+  URL のクリック      文中の URL / PDF のリンク(http, https)をクリック → 確認ダイアログで「開く」を選ぶと
+                      既定のブラウザで開く (ドラッグ・ダブルクリックは従来どおりテキスト選択)
 
 設定(表示方法・1ページ目単独・綴じ方向・フルスクリーン)は変更時に自動保存され、次回起動時に
-復元されます。拡大率とウィンドウサイズは保存せず、通常モードで起動するたびに
+復元されます。capture_long_side は設定ファイル(settings.json)を直接書き換えて変更します。拡大率とウィンドウサイズは保存せず、通常モードで起動するたびに
 「ページ全体が画面に収まる倍率」と「それに合わせたウィンドウサイズ」へ自動調整します。
 
 使い方
@@ -37,6 +40,7 @@ import sys
 import tempfile
 import time
 import tkinter as tk
+import webbrowser
 from pathlib import Path
 from tkinter import ttk, filedialog, messagebox, simpledialog
 
@@ -54,11 +58,14 @@ ZOOM_MIN, ZOOM_MAX, ZOOM_STEP = 0.2, 6.0, 1.25
 PRINT_MAX_DPI = 300                  # 印刷時にページを描画する最大解像度
 EDGE_ZONE = 24                       # フルスクリーン: 画面端からこの距離(px)に近づくとスクロールバーを表示
 EDGE_POLL_MS = 100                   # 同: マウス位置の確認間隔
-CAPTURE_DPI = 200                    # 画像保存時の解像度
+CAPTURE_SIDE_MIN, CAPTURE_SIDE_MAX = 100, 10000   # 画像保存時の長辺(px)として許可する範囲
 PAD = 0                              # ページ周囲の余白(px) 0=余白なし
 FIT_EPS = 0.999                      # 倍率の端数切り上げで1pxはみ出してスクロールが出るのを防ぐ
 AUTO_FIT_RATIO = 0.8                 # 起動時の自動調整: ページ全体を画面の何割に収めるか
 GAP_PT = 3                           # 見開きのページ間の隙間(pt)
+URL_CLICK_DELAY_MS = 500             # URLクリック後、ダブルクリック(単語選択)でないと確定するまでの待ち時間
+URL_CLICK_SLOP = 4                   # この距離(px)以内の移動はクリック扱い (それ以上はドラッグ)
+URL_RE = re.compile(r"https?://[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+", re.IGNORECASE)
 BG_RGB = (128, 128, 128)
 SEL_COLOR = (51, 144, 255, 90)
 HIT_COLOR = (255, 230, 0, 120)
@@ -72,6 +79,7 @@ DEFAULT_SETTINGS = {
     "cover_alone": True,        # 見開き時に1ページ目を単独表示
     "binding": "left",          # "left"=左綴じ / "right"=右綴じ (見開き時)
     "fullscreen": False,
+    "capture_long_side": 1280,  # 画像保存時の長辺(px)。設定ファイルを手動で書き換えて変更する
 }
 
 
@@ -102,6 +110,9 @@ def load_settings():
         s["view_mode"] = "single"
     if s["binding"] not in BINDING_LABELS:
         s["binding"] = "left"
+    n = s["capture_long_side"]
+    if isinstance(n, bool) or not CAPTURE_SIDE_MIN <= n <= CAPTURE_SIDE_MAX:
+        s["capture_long_side"] = DEFAULT_SETTINGS["capture_long_side"]
     return s
 
 
@@ -303,9 +314,14 @@ class PdfViewer:
         self._sb_drag = False
         self._vs_shown = False
         self._hs_shown = False
+        # URL クリック
+        self._url_cache = None         # (chars, [(url, [rect, ...]), ...])
+        self._url_press = None         # 単クリックの押下位置 (ドラッグとの区別用)
+        self._url_job = None
 
         self._build_ui()
         self._apply_initial_window()
+        self.save_settings()           # 設定ファイルがなければ作成する (capture_long_side を編集できるように)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         if path:
             self.open_pdf(path)
@@ -488,6 +504,8 @@ class PdfViewer:
             "cover_alone": self.cover_alone,
             "binding": self.binding,
             "fullscreen": self.fullscreen,
+            # アプリ内では変更しない項目。ファイルの現在値を引き継ぎ、手動編集を上書きしない
+            "capture_long_side": load_settings()["capture_long_side"],
         }
         p = settings_path()
         try:
@@ -1218,6 +1236,8 @@ class PdfViewer:
     # ------------------------------------------------------------- マウス操作
     def on_press(self, e, count=1):
         self.canvas.focus_set()
+        self._cancel_url_job()                     # ダブルクリック等ならURLは開かない
+        self._url_press = (e.x, e.y) if count == 1 else None
         if not self.view_pages:
             return
         px, py = self.to_page(e)
@@ -1266,16 +1286,121 @@ class PdfViewer:
     def on_release(self, e):
         self.drag_mode = None
         self._cursor = None
+        press, self._url_press = self._url_press, None
+        if press and abs(e.x - press[0]) <= URL_CLICK_SLOP and abs(e.y - press[1]) <= URL_CLICK_SLOP:
+            url = self.url_at(*self.to_page(e))
+            if url:   # ダブルクリック(単語選択)の1回目かもしれないので、少し待ってから確認する
+                self._url_job = self.root.after(URL_CLICK_DELAY_MS, lambda: self._confirm_and_open_url(url))
         self.on_motion(e)
 
     def on_motion(self, e):
         if self.drag_mode or not self.view_pages:
             return
         px, py = self.to_page(e)
-        want = "xterm" if self.on_text(px, py) else ""
+        if self.url_at(px, py):
+            want = "hand2"
+        else:
+            want = "xterm" if self.on_text(px, py) else ""
         if want != self._cursor:
             self._cursor = want
             self.canvas.config(cursor=want)
+
+    # ------------------------------------------------------------- URL のクリック
+    def _build_urls(self):
+        """表示中のページにある URL を [(url, [rect, ...])] で返す (座標は見開き全体の座標系, pt)。
+        PDF のリンク注釈(http/https のみ)と、本文中の URL 文字列(1行内)の両方を対象にする"""
+        spans = []
+        for pno, xo, yo, _, _ in self.view_layout:
+            try:
+                links = self.doc[pno].get_links()
+            except Exception:
+                continue
+            for lk in links:
+                uri = lk.get("uri") or ""
+                if lk.get("kind") == fitz.LINK_URI and lk.get("from") and re.match(r"https?://", uri, re.I):
+                    r = lk["from"]
+                    spans.append((uri, [(r.x0 + xo, r.y0 + yo, r.x1 + xo, r.y1 + yo)]))
+        i, n = 0, len(self.chars)
+        while i < n:
+            lid = self.chars[i][2]
+            j = i
+            while j < n and self.chars[j][2] == lid:
+                j += 1
+            text, starts = "", []
+            for k in range(i, j):
+                starts.append(len(text))
+                text += self.chars[k][0]
+            for m in URL_RE.finditer(text):
+                url = m.group()
+                while url and (url[-1] in ".,;:!?'" or (url[-1] == ")" and url.count("(") < url.count(")"))):
+                    url = url[:-1]      # 文末の句読点や、対応のない閉じ括弧は URL に含めない
+                if len(url) <= url.index("//") + 2:
+                    continue
+                a = bisect.bisect_right(starts, m.start()) - 1
+                b = bisect.bisect_right(starts, m.start() + len(url) - 1) - 1
+                rs = [self.chars[k][1] for k in range(i + a, i + b + 1)]
+                spans.append((url, [(min(r[0] for r in rs), min(r[1] for r in rs),
+                                     max(r[2] for r in rs), max(r[3] for r in rs))]))
+            i = j
+        return spans
+
+    def url_at(self, px, py, m=1.0):
+        """ページ座標 (px, py) にある URL を返す (なければ None)"""
+        if not self.view_pages:
+            return None
+        if self._url_cache is None or self._url_cache[0] is not self.chars:
+            self._url_cache = (self.chars, self._build_urls())
+        for url, rects in self._url_cache[1]:
+            for x0, y0, x1, y1 in rects:
+                if x0 - m <= px <= x1 + m and y0 - m <= py <= y1 + m:
+                    return url
+        return None
+
+    def _cancel_url_job(self):
+        if self._url_job:
+            self.root.after_cancel(self._url_job)
+            self._url_job = None
+
+    def _confirm_and_open_url(self, url):
+        self._url_job = None
+        if self.confirm_open_url(url):
+            try:
+                webbrowser.open(url)
+            except Exception as ex:
+                messagebox.showerror("エラー", f"ブラウザを起動できませんでした:\n{ex}")
+
+    def confirm_open_url(self, url):
+        """「開く」/「キャンセル」の確認ダイアログ。開く場合 True"""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("リンクを開く")
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        frm = ttk.Frame(dlg, padding=12)
+        frm.pack()
+        ttk.Label(frm, text="次のURLをブラウザで開きますか?").pack(anchor="w")
+        ttk.Label(frm, text=url, wraplength=480, foreground="#0645ad").pack(anchor="w", pady=(6, 10))
+        ans = []
+
+        def done(v):
+            ans.append(v)
+            dlg.destroy()
+
+        btns = ttk.Frame(frm)
+        btns.pack(anchor="e")
+        open_btn = ttk.Button(btns, text="開く", command=lambda: done(True))
+        open_btn.pack(side="left", padx=4)
+        ttk.Button(btns, text="キャンセル", command=lambda: done(False)).pack(side="left")
+        dlg.bind("<Return>", lambda e: done(True))
+        dlg.bind("<Escape>", lambda e: done(False))
+        dlg.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - dlg.winfo_reqwidth()) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - dlg.winfo_reqheight()) // 2
+        dlg.geometry(f"+{max(0, x)}+{max(0, y)}")
+        open_btn.focus_set()
+        dlg.grab_set()
+        self.root.wait_window(dlg)
+        self.canvas.focus_set()
+        return bool(ans and ans[0])
 
     # ------------------------------------------------------------- コピー
     def selected_text(self):
@@ -1453,7 +1578,11 @@ class PdfViewer:
         """表示中のページ(見開きなら2ページ分)を PNG にして PDF と同じフォルダへ保存"""
         if not (self.doc and self.view_pages and self.path):
             return "break"
-        img = self.compose_view(CAPTURE_DPI / 72, (255, 255, 255))
+        long_side = load_settings()["capture_long_side"]    # 設定ファイルの現在値 (編集後すぐ反映)
+        img = self.compose_view(long_side / max(self.view_w, self.view_h), (255, 255, 255))
+        if max(img.size) != long_side:                      # ピクセル単位の端数で数px ずれた分を補正
+            k = long_side / max(img.size)
+            img = img.resize((max(1, round(img.width * k)), max(1, round(img.height * k))), Image.LANCZOS)
         width = max(3, len(str(len(self.doc))))
         nums = [f"{p + 1:0{width}d}" for p in self.view_pages]
         label = nums[0] if len(nums) == 1 else f"{nums[0]}-{nums[-1]}"
